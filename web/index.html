@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="sr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pametna sigurnosna kamera</title>
+<style>
+  /* ---- Boje (svetla i tamna tema se biraju automatski) ---- */
+  :root {
+    --pozadina: #f3f5f8; --kartica: #ffffff; --tekst: #1c2430; --tekst2: #5d6b7e;
+    --ivica: #dde3ea; --akcent: #1f6feb; --dobro: #1a9a4a; --lose: #d93025; --upozorenje: #e08a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --pozadina: #0f141b; --kartica: #1a212b; --tekst: #e8edf3; --tekst2: #9aa7b8;
+      --ivica: #2b3542; --akcent: #4c8dff; --dobro: #3ccf74; --lose: #ff6b60; --upozorenje: #ffb02e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--pozadina); color: var(--tekst);
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.4; }
+  .strana { max-width: 960px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 8px 0 4px; }
+  .podnaslov { color: var(--tekst2); margin: 0 0 16px; font-size: .95rem; }
+
+  /* ---- Gornja traka sa statusima ---- */
+  .statusi { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .znacka { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
+            background: var(--kartica); border: 1px solid var(--ivica); border-radius: 999px; font-size: .9rem; }
+  .tacka { width: 10px; height: 10px; border-radius: 50%; background: var(--tekst2); }
+  .tacka.on { background: var(--dobro); }
+  .tacka.off { background: var(--lose); }
+
+  /* ---- Baner upozorenja o pokretu ---- */
+  .baner { display: none; margin-bottom: 16px; padding: 14px 16px; border-radius: 12px;
+           background: var(--lose); color: #fff; font-weight: 600; }
+  .baner.aktivan { display: block; animation: puls 1s ease-in-out infinite; }
+  @keyframes puls { 50% { opacity: .75; } }
+
+  /* ---- Kartice ---- */
+  .mreza { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .mreza { grid-template-columns: 1fr; } }
+  .kartica { background: var(--kartica); border: 1px solid var(--ivica); border-radius: 14px; padding: 16px; }
+  .kartica h2 { font-size: 1rem; margin: 0 0 12px; }
+  .siroka { grid-column: 1 / -1; }
+
+  /* ---- Upravljanje kamerom ---- */
+  .merac { width: 100%; max-width: 280px; display: block; margin: 0 auto 8px; }
+  .ugao { text-align: center; font-size: 1.6rem; font-weight: 700; margin-bottom: 12px; }
+  .dugmad { display: flex; gap: 12px; }
+  button { flex: 1; padding: 12px; font-size: 1rem; font-weight: 600; border-radius: 10px; cursor: pointer;
+           border: 1px solid var(--akcent); background: var(--akcent); color: #fff; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.sporedno { background: transparent; color: var(--akcent); }
+
+  /* ---- Pokret i kamera ---- */
+  .veliko { font-size: 1.8rem; font-weight: 700; margin: 4px 0; }
+  .veliko.pokret { color: var(--lose); }
+  .veliko.mirno { color: var(--dobro); }
+  .red { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--ivica); }
+  .red:last-of-type { border-bottom: 0; }
+  .napomena { color: var(--tekst2); font-size: .85rem; margin-top: 10px; }
+
+  /* ---- Dnevnik ---- */
+  ul#dnevnik { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; }
+  ul#dnevnik li { padding: 6px 0; border-bottom: 1px solid var(--ivica); font-size: .92rem; }
+  ul#dnevnik li .vreme { color: var(--tekst2); margin-right: 8px; font-variant-numeric: tabular-nums; }
+  ul#dnevnik li.pokret { color: var(--lose); font-weight: 600; }
+  ul#dnevnik li.komanda { color: var(--akcent); }
+</style>
+</head>
+<body>
+<div class="strana">
+  <h1>Pametna sigurnosna kamera</h1>
+  <p class="podnaslov">Virtuelni prototip: ESP32 (Wokwi) &harr; MQTT &harr; veb-interfejs</p>
+
+  <div class="statusi">
+    <span class="znacka"><span class="tacka" id="tackaBroker"></span><span id="tekstBroker">Broker: povezivanje...</span></span>
+    <span class="znacka"><span class="tacka" id="tackaEsp"></span><span id="tekstEsp">ESP32: nepoznato</span></span>
+    <button class="sporedno" id="dugmeObavestenja" style="flex:none; padding:6px 12px; font-size:.9rem;">Uključi zvuk i obaveštenja</button>
+  </div>
+
+  <div class="baner" id="baner">POKRET DETEKTOVAN &ndash; kamera je aktivirana</div>
+
+  <div class="mreza">
+    <!-- Upravljanje servo motorom -->
+    <section class="kartica">
+      <h2>Upravljanje kamerom</h2>
+      <svg class="merac" viewBox="0 0 200 120" role="img" aria-label="Položaj kamere">
+        <path d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="var(--ivica)" stroke-width="10" stroke-linecap="round"/>
+        <line x1="100" y1="100" x2="100" y2="32" id="kazaljka" stroke="var(--akcent)" stroke-width="4" stroke-linecap="round"
+              style="transform-origin:100px 100px; transform:rotate(0deg); transition:transform .3s;"/>
+        <circle cx="100" cy="100" r="6" fill="var(--akcent)"/>
+        <text x="20" y="118" font-size="11" text-anchor="middle" fill="var(--tekst2)">0°</text>
+        <text x="100" y="20" font-size="11" text-anchor="middle" fill="var(--tekst2)">90°</text>
+        <text x="180" y="118" font-size="11" text-anchor="middle" fill="var(--tekst2)">180°</text>
+      </svg>
+      <div class="ugao" id="ugao">-- °</div>
+      <div class="dugmad">
+        <button id="dugmeLevo" disabled>&#9664; LEVO</button>
+        <button id="dugmeDesno" disabled>DESNO &#9654;</button>
+      </div>
+      <p class="napomena">Prečice na tastaturi: strelica levo / desno.</p>
+    </section>
+
+    <!-- Detekcija pokreta -->
+    <section class="kartica">
+      <h2>Detekcija pokreta</h2>
+      <div class="veliko mirno" id="stanjePokreta">MIRNO</div>
+      <div class="red"><span>Kamera</span><strong id="stanjeKamere">isključena</strong></div>
+      <div class="red"><span>Broj detekcija</span><strong id="brojPokreta">0</strong></div>
+      <p class="napomena">Kamera se aktivira kad PIR senzor registruje pokret. Prepoznavanje objekata na slici dodajemo u Fazi 4.</p>
+    </section>
+
+    <!-- Dnevnik događaja -->
+    <section class="kartica siroka">
+      <h2>Dnevnik događaja</h2>
+      <ul id="dnevnik"></ul>
+    </section>
+  </div>
+</div>
+
+<!-- MQTT.js: biblioteka koja omogućava MQTT u pregledaču (preko WebSocket-a) -->
+<script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"></script>
+<script>
+// ===== Konfiguracija =====
+// Pregledač ne može da koristi običan MQTT (port 1883), zato koristimo WebSocket (wss, port 8884).
+const BROKER_URL = 'wss://broker.hivemq.com:8884/mqtt';
+const PREFIKS = 'pmf-iot/marko-7k2x/';            // MORA biti isti kao u ESP32 programu
+const TEMA_POKRET       = PREFIKS + 'motion';      // ESP32 -> veb: događaj pokreta
+const TEMA_STATUS       = PREFIKS + 'status';      // ESP32 -> veb: online/offline
+const TEMA_SERVO_STANJE = PREFIKS + 'servo/state'; // ESP32 -> veb: trenutni ugao
+const TEMA_SERVO_SET    = PREFIKS + 'servo/set';   // veb -> ESP32: komanda levo/desno
+
+const $ = (id) => document.getElementById(id);     // skraćenica za pronalaženje elementa
+
+// ===== Pomoćne funkcije za prikaz =====
+// Napomena: koristimo textContent (ne innerHTML), jer bilo ko može da pošalje poruku na javni broker.
+
+function dodajUDnevnik(tekst, vrsta) {
+  const li = document.createElement('li');
+  if (vrsta) li.className = vrsta;
+  const vreme = document.createElement('span');
+  vreme.className = 'vreme';
+  vreme.textContent = new Date().toLocaleTimeString('sr-RS');
+  li.appendChild(vreme);
+  li.appendChild(document.createTextNode(tekst));
+  $('dnevnik').prepend(li);                          // najnoviji događaj ide na vrh
+  while ($('dnevnik').children.length > 50) $('dnevnik').lastChild.remove();
+}
+
+function prikaziBroker(povezan) {
+  $('tackaBroker').className = 'tacka ' + (povezan ? 'on' : 'off');
+  $('tekstBroker').textContent = 'Broker: ' + (povezan ? 'povezan' : 'nije povezan');
+  $('dugmeLevo').disabled = !povezan;                // dugmad rade samo kad postoji veza
+  $('dugmeDesno').disabled = !povezan;
+}
+
+function prikaziEsp(stanje) {
+  const online = stanje === 'online';
+  $('tackaEsp').className = 'tacka ' + (online ? 'on' : 'off');
+  $('tekstEsp').textContent = 'ESP32: ' + (online ? 'online' : 'offline');
+}
+
+function prikaziUgao(ugao) {
+  $('ugao').textContent = ugao + ' °';
+  $('kazaljka').style.transform = 'rotate(' + (ugao - 90) + 'deg)'; // 90° = kazaljka uspravno
+}
+
+function prikaziPokret(aktivan, broj) {
+  $('stanjePokreta').textContent = aktivan ? 'POKRET!' : 'MIRNO';
+  $('stanjePokreta').className = 'veliko ' + (aktivan ? 'pokret' : 'mirno');
+  $('stanjeKamere').textContent = aktivan ? 'AKTIVIRANA' : 'isključena';
+  $('baner').classList.toggle('aktivan', aktivan);
+  if (broj !== undefined) $('brojPokreta').textContent = broj;
+}
+
+// ===== Zvuk i sistemsko obaveštenje =====
+// Pregledači dozvoljavaju zvuk tek posle klika korisnika, zato postoji dugme.
+let audio = null;
+
+$('dugmeObavestenja').addEventListener('click', () => {
+  audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+  if ('Notification' in window) Notification.requestPermission();
+  $('dugmeObavestenja').textContent = 'Zvuk i obaveštenja uključeni';
+  $('dugmeObavestenja').disabled = true;
+});
+
+function zvucniSignal() {
+  if (!audio) return;
+  const osc = audio.createOscillator();              // generator tona
+  osc.frequency.value = 880;                         // 880 Hz
+  osc.connect(audio.destination);
+  osc.start();
+  osc.stop(audio.currentTime + 0.3);                 // traje 0.3 s
+}
+
+function sistemskoObavestenje(tekst) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification('Pametna kamera', { body: tekst });
+  }
+}
+
+// ===== MQTT veza =====
+const klijent = mqtt.connect(BROKER_URL, {
+  clientId: 'marko-web-' + Math.random().toString(16).slice(2, 8), // jedinstven ID klijenta
+  reconnectPeriod: 3000                                             // ponovni pokušaj na svake 3 s
+});
+
+klijent.on('connect', () => {
+  prikaziBroker(true);
+  dodajUDnevnik('Povezan na MQTT broker');
+  // pretplata: kažemo brokeru koje teme želimo da primamo
+  klijent.subscribe([TEMA_POKRET, TEMA_STATUS, TEMA_SERVO_STANJE]);
+});
+klijent.on('close', () => prikaziBroker(false));
+klijent.on('error', (greska) => dodajUDnevnik('MQTT greška: ' + greska.message));
+
+// Poziva se za svaku poruku koja stigne na neku od tema na koje smo pretplaćeni
+klijent.on('message', (tema, payload) => {
+  const poruka = payload.toString();
+
+  if (tema === TEMA_STATUS) {                        // "online" ili "offline"
+    prikaziEsp(poruka);
+    dodajUDnevnik('ESP32 je ' + (poruka === 'online' ? 'online' : 'offline'));
+
+  } else if (tema === TEMA_SERVO_STANJE) {           // trenutni ugao servo motora
+    const ugao = parseInt(poruka, 10);
+    if (!isNaN(ugao)) prikaziUgao(Math.min(180, Math.max(0, ugao)));
+
+  } else if (tema === TEMA_POKRET) {                 // JSON: {"stanje":"pokret","broj":1}
+    let podaci;
+    try { podaci = JSON.parse(poruka); } catch (e) { return; } // ignoriši neispravne poruke
+    if (podaci.stanje === 'pokret') {
+      prikaziPokret(true, Number(podaci.broj) || 0);
+      dodajUDnevnik('POKRET detektovan (#' + (Number(podaci.broj) || '?') + ') – kamera aktivirana', 'pokret');
+      zvucniSignal();
+      sistemskoObavestenje('Pokret detektovan!');
+    } else if (podaci.stanje === 'mirno') {
+      prikaziPokret(false);
+      dodajUDnevnik('Pokret prestao – kamera isključena');
+    }
+  }
+});
+
+// ===== Komande za servo =====
+function posaljiKomandu(smer) {                      // smer je "levo" ili "desno"
+  if (!klijent.connected) return;
+  klijent.publish(TEMA_SERVO_SET, smer);
+  dodajUDnevnik('Poslata komanda: ' + smer.toUpperCase(), 'komanda');
+}
+$('dugmeLevo').addEventListener('click', () => posaljiKomandu('levo'));
+$('dugmeDesno').addEventListener('click', () => posaljiKomandu('desno'));
+
+// Prečice na tastaturi
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft') posaljiKomandu('levo');
+  if (e.key === 'ArrowRight') posaljiKomandu('desno');
+});
+
+prikaziBroker(false);
+</script>
+</body>
+</html>
