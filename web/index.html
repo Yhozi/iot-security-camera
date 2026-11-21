@@ -61,12 +61,42 @@
   .red:last-of-type { border-bottom: 0; }
   .napomena { color: var(--tekst2); font-size: .85rem; margin-top: 10px; }
 
+  /* ---- Virtuelna kamera ---- */
+  .video-okvir { position: relative; max-width: 760px; margin: 0 auto; aspect-ratio: 16 / 9; background: #000;
+                 border-radius: 12px; overflow: hidden; border: 3px solid transparent; }
+  .video-okvir.alarm { border-color: var(--lose); }          /* crveni okvir kad PIR javi pokret */
+  .video-okvir img { width: 100%; height: 100%; object-fit: contain; display: none; }
+  .video-okvir.aktivna img { display: block; }
+  .video-prazno { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                  color: #9aa7b8; text-align: center; padding: 16px; }
+  .video-okvir.aktivna .video-prazno { display: none; }
+  .oznaka { position: absolute; display: none; padding: 4px 10px; border-radius: 6px; font-size: .85rem; font-weight: 600;
+            background: rgba(0,0,0,.55); color: #fff; font-variant-numeric: tabular-nums; }
+  .video-okvir.aktivna .oznaka { display: block; }
+  .oznaka.gore-levo { top: 10px; left: 10px; }
+  .oznaka.gore-desno { top: 10px; right: 10px; }
+  .oznaka .rec { color: #ff4d4d; }
+  .kamera-akcije { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; justify-content: center; }
+  .kamera-akcije button { flex: none; padding: 10px 22px; }
+  .prekidac { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; font-weight: 600; user-select: none; }
+  .prekidac input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .klizac { position: relative; width: 48px; height: 26px; border-radius: 999px; background: var(--ivica); transition: background .2s; }
+  .klizac::after { content: ''; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%;
+                   background: #fff; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  .prekidac input:checked + .klizac { background: var(--dobro); }
+  .prekidac input:checked + .klizac::after { transform: translateX(22px); }
+  .prekidac input:focus-visible + .klizac { outline: 2px solid var(--akcent); outline-offset: 2px; }
+  .prekidac input:disabled + .klizac { opacity: .45; }
+  .kamera-poruka { font-size: .9rem; color: var(--tekst2); }
+  .kamera-poruka.greska { color: var(--lose); }
+
   /* ---- Dnevnik ---- */
   ul#dnevnik { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; }
   ul#dnevnik li { padding: 6px 0; border-bottom: 1px solid var(--ivica); font-size: .92rem; }
   ul#dnevnik li .vreme { color: var(--tekst2); margin-right: 8px; font-variant-numeric: tabular-nums; }
   ul#dnevnik li.pokret { color: var(--lose); font-weight: 600; }
   ul#dnevnik li.komanda { color: var(--akcent); }
+  ul#dnevnik li.upozorenje { color: var(--upozorenje); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -107,9 +137,27 @@
     <section class="kartica">
       <h2>Detekcija pokreta</h2>
       <div class="veliko mirno" id="stanjePokreta">MIRNO</div>
-      <div class="red"><span>Kamera</span><strong id="stanjeKamere">isključena</strong></div>
+      <div class="red"><span>Okidač kamere</span><strong id="stanjeKamere">mirovanje</strong></div>
       <div class="red"><span>Broj detekcija</span><strong id="brojPokreta">0</strong></div>
       <p class="napomena">Kamera se aktivira kad PIR senzor registruje pokret. Prepoznavanje objekata na slici dodajemo u Fazi 4.</p>
+    </section>
+
+    <!-- Virtuelna kamera: Wokwi ne simulira kameru, pa "kadar" dolazi iz slike koju izabereš.
+         Na pravom uređaju ovde ide prenos sa ESP32-CAM; ostatak interfejsa ostaje isti. -->
+    <section class="kartica siroka">
+      <h2>Kamera (virtuelna)</h2>
+      <div class="video-okvir" id="videoOkvir">
+        <img id="kameraSlika" alt="Kadar sa kamere">
+        <div class="video-prazno" id="videoPrazno">Kamera je isključena</div>
+        <div class="oznaka gore-levo"><span class="rec">&#9679;</span> UŽIVO <span id="satKamere"></span></div>
+        <div class="oznaka gore-desno" id="oznakaUgao">Ugao: -- °</div>
+      </div>
+      <input type="file" id="izborSlike" accept="image/*" hidden>
+      <div class="kamera-akcije">
+        <label class="prekidac"><input type="checkbox" id="prekidacKamera" disabled><span class="klizac"></span><span id="tekstPrekidaca">Kamera isključena</span></label>
+        <button id="dugmeSlika" class="sporedno">Izaberi sliku</button>
+        <span class="kamera-poruka" id="porukaKamere"></span>
+      </div>
     </section>
 
     <!-- Dnevnik događaja -->
@@ -131,8 +179,11 @@ const TEMA_POKRET       = PREFIKS + 'motion';      // ESP32 -> veb: događaj pok
 const TEMA_STATUS       = PREFIKS + 'status';      // ESP32 -> veb: online/offline
 const TEMA_SERVO_STANJE = PREFIKS + 'servo/state'; // ESP32 -> veb: trenutni ugao
 const TEMA_SERVO_SET    = PREFIKS + 'servo/set';   // veb -> ESP32: komanda levo/desno
+const TEMA_KAMERA_SET   = PREFIKS + 'camera/set';  // veb -> ESP32: komanda on/off
+const TEMA_KAMERA_STANJE = PREFIKS + 'camera/state'; // ESP32 -> veb: trenutno stanje kamere (on/off)
 
 const $ = (id) => document.getElementById(id);     // skraćenica za pronalaženje elementa
+let cekanjePotvrde = null;                         // tajmer: čeka potvrdu ESP32 posle komande
 
 // ===== Pomoćne funkcije za prikaz =====
 // Napomena: koristimo textContent (ne innerHTML), jer bilo ko može da pošalje poruku na javni broker.
@@ -154,6 +205,7 @@ function prikaziBroker(povezan) {
   $('tekstBroker').textContent = 'Broker: ' + (povezan ? 'povezan' : 'nije povezan');
   $('dugmeLevo').disabled = !povezan;                // dugmad rade samo kad postoji veza
   $('dugmeDesno').disabled = !povezan;
+  $('prekidacKamera').disabled = !povezan;
 }
 
 function prikaziEsp(stanje) {
@@ -165,12 +217,14 @@ function prikaziEsp(stanje) {
 function prikaziUgao(ugao) {
   $('ugao').textContent = ugao + ' °';
   $('kazaljka').style.transform = 'rotate(' + (ugao - 90) + 'deg)'; // 90° = kazaljka uspravno
+  $('oznakaUgao').textContent = 'Ugao: ' + ugao + ' °';               // ugao i u uglu kadra
 }
 
 function prikaziPokret(aktivan, broj) {
   $('stanjePokreta').textContent = aktivan ? 'POKRET!' : 'MIRNO';
   $('stanjePokreta').className = 'veliko ' + (aktivan ? 'pokret' : 'mirno');
-  $('stanjeKamere').textContent = aktivan ? 'AKTIVIRANA' : 'isključena';
+  $('stanjeKamere').textContent = aktivan ? 'AKTIVIRANA' : 'mirovanje';
+  $('videoOkvir').classList.toggle('alarm', aktivan); // crveni okvir oko slike dok traje pokret
   $('baner').classList.toggle('aktivan', aktivan);
   if (broj !== undefined) $('brojPokreta').textContent = broj;
 }
@@ -201,6 +255,68 @@ function sistemskoObavestenje(tekst) {
   }
 }
 
+// ===== Virtuelna kamera =====
+// Wokwi nema kameru, pa je "kadar" slika koju korisnik izabere sa računara.
+// Da li je kamera UKLJUČENA određuje ESP32 (PIR pokret, dugme na ESP32 ili klizač ovde);
+// stanje stiže preko MQTT-a, pa su Wokwi i veb-interfejs uvek usklađeni.
+// Kasnije se samo izvor slike zamenjuje (npr. prenos sa ESP32-CAM), a ostatak interfejsa ostaje isti.
+let kameraUkljucena = false;
+let urlSlike = null;                                 // adresa izabrane slike u pregledaču (blob URL)
+
+function porukaKamere(tekst, greska) {
+  $('porukaKamere').textContent = tekst;
+  $('porukaKamere').className = 'kamera-poruka' + (greska ? ' greska' : '');
+}
+
+// Kadar se vidi samo ako je kamera uključena i slika izabrana
+function osveziKadar() {
+  $('videoOkvir').classList.toggle('aktivna', kameraUkljucena && !!urlSlike);
+  $('videoPrazno').textContent = !kameraUkljucena ? 'Kamera je isključena'
+                               : 'Kamera je uključena – izaberi sliku (dugme ispod)';
+}
+
+function prikaziKameru(ukljucena) {
+  const promena = (ukljucena !== kameraUkljucena);
+  kameraUkljucena = ukljucena;
+  $('prekidacKamera').checked = ukljucena;
+  $('tekstPrekidaca').textContent = ukljucena ? 'Kamera uključena' : 'Kamera isključena';
+  osveziKadar();
+  if (promena) dodajUDnevnik(ukljucena ? 'Kamera uključena' : 'Kamera isključena');
+}
+
+// Klizač samo ŠALJE komandu; prikaz se menja tek kad ESP32 potvrdi novo stanje
+$('prekidacKamera').addEventListener('change', () => {
+  const zeljeno = $('prekidacKamera').checked;
+  $('prekidacKamera').checked = kameraUkljucena;     // vrati na pravo stanje dok ESP32 ne potvrdi
+  if (!klijent.connected) return;
+  klijent.publish(TEMA_KAMERA_SET, zeljeno ? 'on' : 'off');
+  dodajUDnevnik('Poslata komanda: kamera ' + (zeljeno ? 'ON' : 'OFF'), 'komanda');
+  clearTimeout(cekanjePotvrde);
+  cekanjePotvrde = setTimeout(() => dodajUDnevnik('ESP32 nije potvrdio komandu (veza je možda prekinuta)', 'upozorenje'), 3000);
+});
+
+$('dugmeSlika').addEventListener('click', () => $('izborSlike').click());
+
+$('izborSlike').addEventListener('change', (e) => {
+  const fajl = e.target.files[0];
+  e.target.value = '';                               // dozvoli ponovni izbor iste slike
+  if (!fajl) return;
+  if (!fajl.type.startsWith('image/')) { porukaKamere('Izaberi sliku (jpg, png...).', true); return; }
+  if (urlSlike) URL.revokeObjectURL(urlSlike);       // oslobodi staru sliku iz memorije
+  urlSlike = URL.createObjectURL(fajl);
+  $('kameraSlika').src = urlSlike;
+  porukaKamere('Slika: ' + fajl.name);
+  osveziKadar();
+});
+$('kameraSlika').addEventListener('error', () => {
+  porukaKamere('Slika nije ispravna.', true);
+  urlSlike = null;
+  osveziKadar();
+});
+
+// Sat u uglu kadra, kao na pravom prenosu
+setInterval(() => { $('satKamere').textContent = new Date().toLocaleTimeString('sr-RS'); }, 1000);
+
 // ===== MQTT veza =====
 const klijent = mqtt.connect(BROKER_URL, {
   clientId: 'marko-web-' + Math.random().toString(16).slice(2, 8), // jedinstven ID klijenta
@@ -211,7 +327,7 @@ klijent.on('connect', () => {
   prikaziBroker(true);
   dodajUDnevnik('Povezan na MQTT broker');
   // pretplata: kažemo brokeru koje teme želimo da primamo
-  klijent.subscribe([TEMA_POKRET, TEMA_STATUS, TEMA_SERVO_STANJE]);
+  klijent.subscribe([TEMA_POKRET, TEMA_STATUS, TEMA_SERVO_STANJE, TEMA_KAMERA_STANJE]);
 });
 klijent.on('close', () => prikaziBroker(false));
 klijent.on('error', (greska) => dodajUDnevnik('MQTT greška: ' + greska.message));
@@ -225,8 +341,13 @@ klijent.on('message', (tema, payload) => {
     dodajUDnevnik('ESP32 je ' + (poruka === 'online' ? 'online' : 'offline'));
 
   } else if (tema === TEMA_SERVO_STANJE) {           // trenutni ugao servo motora
+    clearTimeout(cekanjePotvrde);                    // ESP32 se javio, komanda je stigla
     const ugao = parseInt(poruka, 10);
     if (!isNaN(ugao)) prikaziUgao(Math.min(180, Math.max(0, ugao)));
+
+  } else if (tema === TEMA_KAMERA_STANJE) {          // "on" ili "off": ESP32 je jedini izvor istine
+    clearTimeout(cekanjePotvrde);
+    prikaziKameru(poruka === 'on');
 
   } else if (tema === TEMA_POKRET) {                 // JSON: {"stanje":"pokret","broj":1}
     let podaci;
@@ -248,6 +369,9 @@ function posaljiKomandu(smer) {                      // smer je "levo" ili "desn
   if (!klijent.connected) return;
   klijent.publish(TEMA_SERVO_SET, smer);
   dodajUDnevnik('Poslata komanda: ' + smer.toUpperCase(), 'komanda');
+  // ESP32 posle svake komande objavi novi ugao. Ako potvrde nema 3 s, veza je verovatno prekinuta.
+  clearTimeout(cekanjePotvrde);
+  cekanjePotvrde = setTimeout(() => dodajUDnevnik('ESP32 nije potvrdio komandu (veza je možda prekinuta)', 'upozorenje'), 3000);
 }
 $('dugmeLevo').addEventListener('click', () => posaljiKomandu('levo'));
 $('dugmeDesno').addEventListener('click', () => posaljiKomandu('desno'));
