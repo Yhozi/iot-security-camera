@@ -1,7 +1,7 @@
-// ===== Virtuelna pametna sigurnosna kamera - FAZA 2 (v2, sa dijagnostikom) =====
-// Faza 1 + Wi-Fi + MQTT:
-//  - pokret se šalje veb-interfejsu preko MQTT-a
-//  - komande "levo"/"desno" iz interfejsa okreću servo
+// ===== Virtuelna pametna sigurnosna kamera - FAZA 2 (v3) =====
+// PIR pokret -> LED + buzzer + kamera se UKLJUCI + MQTT obaveštenje
+// Dugme KAMERA (ili klizač u veb-interfejsu) -> uključuje/isključuje kameru kad god želiš
+// Dugmad LEVO/DESNO (ili dugmad u veb-interfejsu) -> okreću servo motor
 
 #include <WiFi.h>          // Wi-Fi veza
 #include <PubSubClient.h>  // MQTT klijent
@@ -16,18 +16,21 @@ const int   WIFI_KANAL = 6;
 const char* MQTT_BROKER = "broker.hivemq.com"; // javni broker, bez naloga
 const int   MQTT_PORT   = 1883;                // običan MQTT port (za ESP32)
 #define PREFIKS "pmf-iot/marko-7k2x/"          // isti prefiks mora biti i u veb-interfejsu
-const char* TEMA_POKRET       = PREFIKS "motion";       // ESP32 -> svet: događaj pokreta
-const char* TEMA_STATUS       = PREFIKS "status";       // ESP32 -> svet: online/offline
-const char* TEMA_SERVO_SET    = PREFIKS "servo/set";    // svet -> ESP32: komanda levo/desno
-const char* TEMA_SERVO_STANJE = PREFIKS "servo/state";  // ESP32 -> svet: trenutni ugao
+const char* TEMA_POKRET        = PREFIKS "motion";        // ESP32 -> svet: događaj pokreta
+const char* TEMA_STATUS        = PREFIKS "status";        // ESP32 -> svet: online/offline
+const char* TEMA_SERVO_SET     = PREFIKS "servo/set";     // svet -> ESP32: levo/desno
+const char* TEMA_SERVO_STANJE  = PREFIKS "servo/state";   // ESP32 -> svet: trenutni ugao
+const char* TEMA_KAMERA_SET    = PREFIKS "camera/set";    // svet -> ESP32: on/off/toggle
+const char* TEMA_KAMERA_STANJE = PREFIKS "camera/state";  // ESP32 -> svet: on/off
 
 // ---- Konfiguracija pinova ----
-const int PIN_PIR       = 13;  // izlaz PIR senzora
-const int PIN_SERVO     = 18;  // PWM signal za servo
-const int PIN_LED       = 26;  // LED dioda (preko otpornika 220 oma)
-const int PIN_BUZZER    = 27;  // buzzer
-const int PIN_BTN_LEVO  = 32;  // lokalno dugme LEVO (za testiranje)
-const int PIN_BTN_DESNO = 33;  // lokalno dugme DESNO (za testiranje)
+const int PIN_PIR        = 13;  // izlaz PIR senzora
+const int PIN_SERVO      = 18;  // PWM signal za servo
+const int PIN_LED        = 26;  // LED dioda (preko otpornika 220 oma)
+const int PIN_BUZZER     = 27;  // buzzer
+const int PIN_BTN_LEVO   = 32;  // lokalno dugme LEVO
+const int PIN_BTN_DESNO  = 33;  // lokalno dugme DESNO
+const int PIN_BTN_KAMERA = 14;  // lokalno dugme KAMERA (uključi/isključi)
 
 // ---- Podešavanja servo motora ----
 const int UGAO_START = 90;
@@ -35,17 +38,22 @@ const int UGAO_MIN   = 0;
 const int UGAO_MAX   = 180;
 const int KORAK      = 15;     // stepeni po jednoj komandi
 
+const unsigned long PAUZA_PONOVNOG_POVEZIVANJA = 1000; // posle prekida veze pokušaj ponovo za 1 s
+
 WiFiClient   wifiKlijent;          // TCP veza ka internetu
 PubSubClient mqtt(wifiKlijent);    // MQTT klijent koji koristi tu vezu
 Servo kameraServo;
 
+String idKlijenta;                 // ID se pravi JEDNOM pri pokretanju (isti ID pri ponovnom povezivanju)
 int ugao = UGAO_START;
+bool kameraUkljucena = false;      // da li je (virtuelna) kamera uključena
 bool prethodnoStanje = false;
 bool prethodnoLevo = false;
 bool prethodnoDesno = false;
-bool bioPovezan = false;             // da li je MQTT veza bila uspostavljena (za dijagnostiku)
+bool prethodnoKamera = false;
+bool bioPovezan = false;           // da li je MQTT veza bila uspostavljena (za dijagnostiku)
 unsigned long brojDogadjaja = 0;
-unsigned long poslednjiPokusaj = 0;  // kada smo poslednji put pokušali MQTT vezu
+unsigned long poslednjiPokusaj = 0;
 
 // Pošalji trenutni ugao kao "retained" poruku: ko se naknadno pretplati odmah dobije poslednji ugao.
 void posaljiUgao() {
@@ -55,8 +63,20 @@ void posaljiUgao() {
   mqtt.publish(TEMA_SERVO_STANJE, buf, true);
 }
 
+// Pošalji stanje kamere (retained), da veb-interfejs uvek zna da li je kamera uključena.
+void posaljiStanjeKamere() {
+  if (!mqtt.connected()) return;
+  mqtt.publish(TEMA_KAMERA_STANJE, kameraUkljucena ? "on" : "off", true);
+}
+
+// Uključi/isključi kameru. Poziva se iz dugmeta, iz MQTT komande i pri detekciji pokreta.
+void postaviKameru(bool ukljuci) {
+  kameraUkljucena = ukljuci;
+  Serial.printf("KAMERA: %s\n", ukljuci ? "uključena" : "isključena");
+  posaljiStanjeKamere();   // uvek javi novo stanje (i kad se nije promenilo, kao potvrdu komande)
+}
+
 // Pomeri servo za delta stepeni (negativno = levo, pozitivno = desno).
-// Poziva se i iz lokalnog dugmeta i iz MQTT komande.
 void pomeriServo(int delta) {
   ugao = constrain(ugao + delta, UGAO_MIN, UGAO_MAX);
   kameraServo.write(ugao);
@@ -83,9 +103,17 @@ void naPoruku(char* tema, byte* payload, unsigned int duzina) {
   poruka.toLowerCase();
   Serial.printf("MQTT primljeno [%s]: %s\n", tema, poruka.c_str());
 
-  if (poruka == "levo")       pomeriServo(-KORAK);
-  else if (poruka == "desno") pomeriServo(+KORAK);
-  else Serial.println("Nepoznata komanda (ocekujem: levo / desno)");
+  if (strcmp(tema, TEMA_SERVO_SET) == 0) {            // komande za servo
+    if (poruka == "levo")       pomeriServo(-KORAK);
+    else if (poruka == "desno") pomeriServo(+KORAK);
+    else Serial.println("Nepoznata komanda (ocekujem: levo / desno)");
+
+  } else if (strcmp(tema, TEMA_KAMERA_SET) == 0) {    // komande za kameru
+    if (poruka == "on")          postaviKameru(true);
+    else if (poruka == "off")    postaviKameru(false);
+    else if (poruka == "toggle") postaviKameru(!kameraUkljucena);
+    else Serial.println("Nepoznata komanda (ocekujem: on / off / toggle)");
+  }
 }
 
 void spojiWiFi() {
@@ -100,18 +128,16 @@ void spojiWiFi() {
 
 // Jedan pokušaj MQTT veze. Last Will: ako ESP32 nestane, broker sam objavi "offline".
 void spojiMQTT() {
-  // ID mora biti jedinstven: dva klijenta sa istim ID-jem izbacuju jedan drugog.
-  // Kombinujemo slučajan broj i trenutno vreme da dve simulacije ne dobiju isti ID.
-  String id = "marko-cam-" + String(random(0xffff), HEX) + String(micros() & 0xfff, HEX);
-  Serial.printf("MQTT: povezivanje (ID %s)... ", id.c_str());
-
-  if (mqtt.connect(id.c_str(), nullptr, nullptr, TEMA_STATUS, 0, true, "offline")) {
+  Serial.printf("MQTT: povezivanje (ID %s)... ", idKlijenta.c_str());
+  if (mqtt.connect(idKlijenta.c_str(), nullptr, nullptr, TEMA_STATUS, 0, true, "offline")) {
     Serial.println("povezan");
     bioPovezan = true;
     mqtt.publish(TEMA_STATUS, "online", true);   // javi da smo online
-    bool ok = mqtt.subscribe(TEMA_SERVO_SET);    // slušaj komande za servo
-    Serial.printf("MQTT: pretplata na %s -> %s\n", TEMA_SERVO_SET, ok ? "OK" : "NEUSPESNO");
+    bool ok1 = mqtt.subscribe(TEMA_SERVO_SET);   // slušaj komande za servo
+    bool ok2 = mqtt.subscribe(TEMA_KAMERA_SET);  // slušaj komande za kameru
+    Serial.printf("MQTT: pretplate -> %s\n", (ok1 && ok2) ? "OK" : "NEUSPESNO");
     posaljiUgao();
+    posaljiStanjeKamere();
   } else {
     Serial.printf("greska (rc=%d), pokusavam ponovo\n", mqtt.state());
   }
@@ -123,16 +149,21 @@ void setup() {
   pinMode(PIN_PIR, INPUT);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_BTN_LEVO, INPUT_PULLUP);
+  pinMode(PIN_BTN_LEVO, INPUT_PULLUP);     // dugme spojeno na GND: pritisnuto = LOW
   pinMode(PIN_BTN_DESNO, INPUT_PULLUP);
+  pinMode(PIN_BTN_KAMERA, INPUT_PULLUP);
 
   kameraServo.attach(PIN_SERVO, 500, 2400);
   kameraServo.write(ugao);
 
+  // ID mora biti jedinstven (dva klijenta sa istim ID-jem izbacuju jedan drugog).
+  // Pravi se jednom: pri ponovnom povezivanju broker prepoznaje isti uređaj i redosled poruka je ispravan.
+  idKlijenta = "marko-cam-" + String(random(0xffff), HEX) + String(micros() & 0xfff, HEX);
+
   spojiWiFi();
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setKeepAlive(30);        // šaljemo "ping" na svakih 30 s da broker zna da smo živi
-  mqtt.setCallback(naPoruku);   // koja funkcija obrađuje dolazne poruke
+  mqtt.setKeepAlive(30);
+  mqtt.setCallback(naPoruku);
   spojiMQTT();
 
   Serial.println("Sistem spreman. Cekam pokret...");
@@ -141,11 +172,12 @@ void setup() {
 void loop() {
   // ---------- 0) Održavanje veze ----------
   if (!mqtt.connected()) {
-    if (bioPovezan) {            // veza je upravo pukla: ispiši razlog (-4 = timeout, -3 = veza izgubljena)
+    if (bioPovezan) {            // veza je upravo pukla (-4 = timeout, -3 = veza izgubljena)
       Serial.printf("MQTT: veza prekinuta, rc=%d\n", mqtt.state());
       bioPovezan = false;
+      poslednjiPokusaj = 0;      // pokušaj odmah, bez čekanja
     }
-    if (millis() - poslednjiPokusaj > 5000) {   // pokušaj ponovo na svakih 5 s
+    if (millis() - poslednjiPokusaj > PAUZA_PONOVNOG_POVEZIVANJA) {
       poslednjiPokusaj = millis();
       if (WiFi.status() != WL_CONNECTED) spojiWiFi();
       spojiMQTT();
@@ -162,6 +194,7 @@ void loop() {
     Serial.printf("[%lu ms] POKRET detektovan (dogadjaj #%lu)\n", millis(), brojDogadjaja);
     digitalWrite(PIN_LED, HIGH);
     beep(300);
+    postaviKameru(true);                 // pokret uključuje kameru (isključuje je korisnik)
 
     char poruka[64];
     snprintf(poruka, sizeof(poruka), "{\"stanje\":\"pokret\",\"broj\":%lu}", brojDogadjaja);
@@ -176,13 +209,18 @@ void loop() {
   }
   prethodnoStanje = pokret;
 
-  // ---------- 2) Lokalna dugmad (za testiranje bez veb-interfejsa) ----------
-  bool levo  = (digitalRead(PIN_BTN_LEVO)  == LOW);
-  bool desno = (digitalRead(PIN_BTN_DESNO) == LOW);
-  if (levo  && !prethodnoLevo)  pomeriServo(-KORAK);
-  if (desno && !prethodnoDesno) pomeriServo(+KORAK);
-  prethodnoLevo  = levo;
-  prethodnoDesno = desno;
+  // ---------- 2) Lokalna dugmad ----------
+  bool levo   = (digitalRead(PIN_BTN_LEVO)   == LOW);  // LOW = pritisnuto
+  bool desno  = (digitalRead(PIN_BTN_DESNO)  == LOW);
+  bool kamera = (digitalRead(PIN_BTN_KAMERA) == LOW);
+
+  if (levo   && !prethodnoLevo)   pomeriServo(-KORAK);          // reaguj samo na trenutak pritiska
+  if (desno  && !prethodnoDesno)  pomeriServo(+KORAK);
+  if (kamera && !prethodnoKamera) postaviKameru(!kameraUkljucena); // svaki pritisak menja stanje
+
+  prethodnoLevo   = levo;
+  prethodnoDesno  = desno;
+  prethodnoKamera = kamera;
 
   delay(20);
 }
