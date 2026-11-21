@@ -87,6 +87,11 @@
   .prekidac input:checked + .klizac::after { transform: translateX(22px); }
   .prekidac input:focus-visible + .klizac { outline: 2px solid var(--akcent); outline-offset: 2px; }
   .prekidac input:disabled + .klizac { opacity: .45; }
+  #slojOkvira { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }  /* sloj za okvire oko objekata */
+  .rezultati { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 12px; min-height: 8px; }
+  .rezultat { padding: 4px 12px; border-radius: 999px; border: 1px solid var(--ivica); background: var(--pozadina);
+              font-size: .9rem; font-variant-numeric: tabular-nums; }
+  .rezultat.osoba { border-color: var(--lose); color: var(--lose); font-weight: 600; }
   .kamera-poruka { font-size: .9rem; color: var(--tekst2); }
   .kamera-poruka.greska { color: var(--lose); }
 
@@ -139,7 +144,7 @@
       <div class="veliko mirno" id="stanjePokreta">MIRNO</div>
       <div class="red"><span>Okidač kamere</span><strong id="stanjeKamere">mirovanje</strong></div>
       <div class="red"><span>Broj detekcija</span><strong id="brojPokreta">0</strong></div>
-      <p class="napomena">Kamera se aktivira kad PIR senzor registruje pokret. Prepoznavanje objekata na slici dodajemo u Fazi 4.</p>
+      <p class="napomena">Kamera se aktivira kad PIR senzor registruje pokret. Objekte na kadru prepoznaješ dugmetom ispod slike.</p>
     </section>
 
     <!-- Virtuelna kamera: Wokwi ne simulira kameru, pa "kadar" dolazi iz slike koju izabereš.
@@ -148,6 +153,7 @@
       <h2>Kamera (virtuelna)</h2>
       <div class="video-okvir" id="videoOkvir">
         <img id="kameraSlika" alt="Kadar sa kamere">
+        <canvas id="slojOkvira"></canvas>
         <div class="video-prazno" id="videoPrazno">Kamera je isključena</div>
         <div class="oznaka gore-levo"><span class="rec">&#9679;</span> UŽIVO <span id="satKamere"></span></div>
         <div class="oznaka gore-desno" id="oznakaUgao">Ugao: -- °</div>
@@ -156,8 +162,10 @@
       <div class="kamera-akcije">
         <label class="prekidac"><input type="checkbox" id="prekidacKamera" disabled><span class="klizac"></span><span id="tekstPrekidaca">Kamera isključena</span></label>
         <button id="dugmeSlika" class="sporedno">Izaberi sliku</button>
+        <button id="dugmeAnaliza" disabled>Prepoznaj objekte</button>
         <span class="kamera-poruka" id="porukaKamere"></span>
       </div>
+      <div class="rezultati" id="rezultati"></div>
     </section>
 
     <!-- Dnevnik događaja -->
@@ -170,6 +178,9 @@
 
 <!-- MQTT.js: biblioteka koja omogućava MQTT u pregledaču (preko WebSocket-a) -->
 <script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"></script>
+<!-- TensorFlow.js + COCO-SSD: gotov model za prepoznavanje 80 vrsta objekata, radi u pregledaču -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <script>
 // ===== Konfiguracija =====
 // Pregledač ne može da koristi običan MQTT (port 1883), zato koristimo WebSocket (wss, port 8884).
@@ -273,6 +284,8 @@ function osveziKadar() {
   $('videoOkvir').classList.toggle('aktivna', kameraUkljucena && !!urlSlike);
   $('videoPrazno').textContent = !kameraUkljucena ? 'Kamera je isključena'
                                : 'Kamera je uključena – izaberi sliku (dugme ispod)';
+  $('dugmeAnaliza').disabled = !(kameraUkljucena && urlSlike);   // analiza traži kadar
+  if (!(kameraUkljucena && urlSlike)) obrisiRezultate();
 }
 
 function prikaziKameru(ukljucena) {
@@ -306,6 +319,7 @@ $('izborSlike').addEventListener('change', (e) => {
   urlSlike = URL.createObjectURL(fajl);
   $('kameraSlika').src = urlSlike;
   porukaKamere('Slika: ' + fajl.name);
+  obrisiRezultate();                                 // nova slika = stari okviri više ne važe
   osveziKadar();
 });
 $('kameraSlika').addEventListener('error', () => {
@@ -316,6 +330,102 @@ $('kameraSlika').addEventListener('error', () => {
 
 // Sat u uglu kadra, kao na pravom prenosu
 setInterval(() => { $('satKamere').textContent = new Date().toLocaleTimeString('sr-RS'); }, 1000);
+
+// ===== Prepoznavanje objekata (COCO-SSD) =====
+// Model se učitava tek pri prvom korišćenju (oko 5 MB), a analiza se radi lokalno u pregledaču.
+const MIN_POUZDANOST = 0.5;                          // prikazujemo samo rezultate sa pouzdanošću >= 50%
+const MAKS_STRANA = 1280;                            // najveća dozvoljena strana slike koja se šalje modelu (px)
+const NAZIVI = { person: 'osoba', cat: 'mačka', dog: 'pas', bird: 'ptica', horse: 'konj', car: 'automobil',
+                 bicycle: 'bicikl', motorcycle: 'motor', bus: 'autobus', truck: 'kamion', backpack: 'ranac',
+                 bottle: 'flaša', chair: 'stolica', couch: 'kauč', tv: 'televizor', laptop: 'laptop',
+                 'cell phone': 'mobilni telefon', cup: 'šolja', book: 'knjiga' };  // ostalo se prikazuje na engleskom
+let modelPromise = null;                             // model se učitava jednom i pamti
+let poslednjiRezultati = [];                         // da se okviri mogu ponovo nacrtati pri promeni veličine
+
+function ucitajModel() {
+  if (typeof cocoSsd === 'undefined') return Promise.reject(new Error('Biblioteka za prepoznavanje nije učitana (proveri internet).'));
+  if (!modelPromise) modelPromise = cocoSsd.load();
+  modelPromise.catch(() => { modelPromise = null; }); // ako učitavanje ne uspe, dozvoli novi pokušaj
+  return modelPromise;
+}
+
+// Slika je prikazana "contain": nađi gde se tačno nalazi unutar okvira, da okviri pogode objekte
+function crtajOkvire(rezultati) {
+  const platno = $('slojOkvira'), okvir = $('videoOkvir'), slika = $('kameraSlika');
+  const sirina = okvir.clientWidth, visina = okvir.clientHeight, dpr = window.devicePixelRatio || 1;
+  platno.width = sirina * dpr; platno.height = visina * dpr;
+  const g = platno.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, sirina, visina);
+  if (!rezultati.length || !slika.naturalWidth) return;
+
+  const skala = Math.min(sirina / slika.naturalWidth, visina / slika.naturalHeight);
+  const ox = (sirina - slika.naturalWidth * skala) / 2, oy = (visina - slika.naturalHeight * skala) / 2;
+  g.font = '600 14px system-ui, sans-serif';
+  g.textBaseline = 'top';
+  for (const r of rezultati) {
+    const [bx, by, bs, bv] = r.bbox;                 // bbox = [x, y, širina, visina] u pikselima originalne slike
+    const x = ox + bx * skala, y = oy + by * skala, w = bs * skala, h = bv * skala;
+    const boja = r.class === 'person' ? '#ff4d4d' : '#ffb02e';
+    g.strokeStyle = boja; g.lineWidth = 3; g.strokeRect(x, y, w, h);
+    const tekst = (NAZIVI[r.class] || r.class) + ' ' + Math.round(r.score * 100) + '%';
+    const sirinaTeksta = g.measureText(tekst).width + 10;
+    const yOznake = y >= 22 ? y - 22 : y;            // oznaka iznad okvira, ili unutar njega ako nema mesta
+    g.fillStyle = boja; g.fillRect(x, yOznake, sirinaTeksta, 22);
+    g.fillStyle = '#000'; g.fillText(tekst, x + 5, yOznake + 4);
+  }
+}
+
+function prikaziRezultate(rezultati) {
+  poslednjiRezultati = rezultati;
+  crtajOkvire(rezultati);
+  const lista = $('rezultati');
+  lista.replaceChildren();                           // textContent umesto innerHTML (bezbedno)
+  for (const r of rezultati) {
+    const oznaka = document.createElement('span');
+    oznaka.className = 'rezultat' + (r.class === 'person' ? ' osoba' : '');
+    oznaka.textContent = (NAZIVI[r.class] || r.class) + ' ' + Math.round(r.score * 100) + '%';
+    lista.appendChild(oznaka);
+  }
+}
+
+function obrisiRezultate() { prikaziRezultate([]); }
+
+async function prepoznajObjekte() {
+  const slika = $('kameraSlika');
+  if (!kameraUkljucena || !urlSlike || !slika.complete || !slika.naturalWidth) return;
+  $('dugmeAnaliza').disabled = true;
+  try {
+    porukaKamere(modelPromise ? 'Analiziram...' : 'Učitavam model (prvi put traje malo duže)...');
+    const model = await ucitajModel();
+    // Model NE dobija <img> element direktno: on bi uzeo veličinu kojom je slika prikazana na stranici (razvučenu),
+    // pa bi okviri promašili objekte. Zato sliku prvo precrtamo na platno u njenoj pravoj proporciji
+    // (najduža strana najviše 1280 px, radi brzine) i model analizira to platno.
+    const f = Math.min(1, MAKS_STRANA / Math.max(slika.naturalWidth, slika.naturalHeight));
+    const ulaz = document.createElement('canvas');
+    ulaz.width = Math.round(slika.naturalWidth * f);
+    ulaz.height = Math.round(slika.naturalHeight * f);
+    ulaz.getContext('2d').drawImage(slika, 0, 0, ulaz.width, ulaz.height);
+    const fx = ulaz.width / slika.naturalWidth, fy = ulaz.height / slika.naturalHeight;
+    const sve = await model.detect(ulaz);            // vraća listu: { bbox, class, score }
+    const rezultati = sve.filter((r) => r.score >= MIN_POUZDANOST)
+      .map((r) => ({ ...r, bbox: [r.bbox[0] / fx, r.bbox[1] / fy, r.bbox[2] / fx, r.bbox[3] / fy] })); // nazad u piksele originalne slike
+    prikaziRezultate(rezultati);
+    if (rezultati.length) {
+      porukaKamere('');
+      dodajUDnevnik('Prepoznato: ' + rezultati.map((r) => (NAZIVI[r.class] || r.class) + ' ' + Math.round(r.score * 100) + '%').join(', '));
+    } else {
+      porukaKamere('Nijedan objekat nije prepoznat.');
+      dodajUDnevnik('Analiza slike: nijedan objekat nije prepoznat');
+    }
+  } catch (e) {
+    porukaKamere('Greška: ' + e.message, true);
+  } finally {
+    $('dugmeAnaliza').disabled = !(kameraUkljucena && urlSlike);
+  }
+}
+$('dugmeAnaliza').addEventListener('click', prepoznajObjekte);
+new ResizeObserver(() => crtajOkvire(poslednjiRezultati)).observe($('videoOkvir')); // preračunaj okvire pri promeni veličine
 
 // ===== MQTT veza =====
 const klijent = mqtt.connect(BROKER_URL, {
