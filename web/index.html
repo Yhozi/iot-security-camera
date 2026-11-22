@@ -144,7 +144,9 @@
       <div class="veliko mirno" id="stanjePokreta">MIRNO</div>
       <div class="red"><span>Okidač kamere</span><strong id="stanjeKamere">mirovanje</strong></div>
       <div class="red"><span>Broj detekcija</span><strong id="brojPokreta">0</strong></div>
-      <p class="napomena">Kamera se aktivira kad PIR senzor registruje pokret. Objekte na kadru prepoznaješ dugmetom ispod slike.</p>
+      <div class="red"><span>Alarm</span><strong id="stanjeAlarma">isključen</strong></div>
+      <button class="sporedno" id="dugmeAlarm" style="width:100%; margin-top:12px;" disabled>Isključi alarm</button>
+      <p class="napomena">Pokret uključuje kameru i pokreće analizu slike. Ako se prepozna osoba, šalje se komanda za alarm ESP32-u.</p>
     </section>
 
     <!-- Virtuelna kamera: Wokwi ne simulira kameru, pa "kadar" dolazi iz slike koju izabereš.
@@ -163,6 +165,7 @@
         <label class="prekidac"><input type="checkbox" id="prekidacKamera" disabled><span class="klizac"></span><span id="tekstPrekidaca">Kamera isključena</span></label>
         <button id="dugmeSlika" class="sporedno">Izaberi sliku</button>
         <button id="dugmeAnaliza" disabled>Prepoznaj objekte</button>
+        <label class="prekidac" style="font-weight:500; font-size:.9rem;"><input type="checkbox" id="autoAnaliza" checked><span class="klizac"></span><span>Automatska analiza pri pokretu</span></label>
         <span class="kamera-poruka" id="porukaKamere"></span>
       </div>
       <div class="rezultati" id="rezultati"></div>
@@ -192,9 +195,12 @@ const TEMA_SERVO_STANJE = PREFIKS + 'servo/state'; // ESP32 -> veb: trenutni uga
 const TEMA_SERVO_SET    = PREFIKS + 'servo/set';   // veb -> ESP32: komanda levo/desno
 const TEMA_KAMERA_SET   = PREFIKS + 'camera/set';  // veb -> ESP32: komanda on/off
 const TEMA_KAMERA_STANJE = PREFIKS + 'camera/state'; // ESP32 -> veb: trenutno stanje kamere (on/off)
+const TEMA_ALARM_SET    = PREFIKS + 'alarm/set';   // veb -> ESP32: alarm on/off
+const TEMA_ALARM_STANJE = PREFIKS + 'alarm/state'; // ESP32 -> veb: stanje alarma (on/off)
 
 const $ = (id) => document.getElementById(id);     // skraćenica za pronalaženje elementa
 let cekanjePotvrde = null;                         // tajmer: čeka potvrdu ESP32 posle komande
+let pokretAktivan = false, alarmAktivan = false;   // stanja koja određuju baner na vrhu strane
 
 // ===== Pomoćne funkcije za prikaz =====
 // Napomena: koristimo textContent (ne innerHTML), jer bilo ko može da pošalje poruku na javni broker.
@@ -217,6 +223,7 @@ function prikaziBroker(povezan) {
   $('dugmeLevo').disabled = !povezan;                // dugmad rade samo kad postoji veza
   $('dugmeDesno').disabled = !povezan;
   $('prekidacKamera').disabled = !povezan;
+  if (!povezan) $('dugmeAlarm').disabled = true;
 }
 
 function prikaziEsp(stanje) {
@@ -231,12 +238,27 @@ function prikaziUgao(ugao) {
   $('oznakaUgao').textContent = 'Ugao: ' + ugao + ' °';               // ugao i u uglu kadra
 }
 
+// Baner na vrhu: alarm (osoba prepoznata) ima prednost nad običnim obaveštenjem o pokretu
+function osveziBaner() {
+  $('baner').textContent = alarmAktivan ? 'ALARM – prepoznata osoba u kadru' : 'POKRET DETEKTOVAN – kamera je aktivirana';
+  $('baner').classList.toggle('aktivan', pokretAktivan || alarmAktivan);
+}
+
+function prikaziAlarm(aktivan) {
+  alarmAktivan = aktivan;
+  $('stanjeAlarma').textContent = aktivan ? 'AKTIVAN' : 'isključen';
+  $('stanjeAlarma').style.color = aktivan ? 'var(--lose)' : '';
+  $('dugmeAlarm').disabled = !aktivan || !klijent.connected;
+  osveziBaner();
+}
+
 function prikaziPokret(aktivan, broj) {
   $('stanjePokreta').textContent = aktivan ? 'POKRET!' : 'MIRNO';
   $('stanjePokreta').className = 'veliko ' + (aktivan ? 'pokret' : 'mirno');
   $('stanjeKamere').textContent = aktivan ? 'AKTIVIRANA' : 'mirovanje';
   $('videoOkvir').classList.toggle('alarm', aktivan); // crveni okvir oko slike dok traje pokret
-  $('baner').classList.toggle('aktivan', aktivan);
+  pokretAktivan = aktivan;
+  osveziBaner();
   if (broj !== undefined) $('brojPokreta').textContent = broj;
 }
 
@@ -391,10 +413,15 @@ function prikaziRezultate(rezultati) {
 
 function obrisiRezultate() { prikaziRezultate([]); }
 
+let analizaUToku = false;
+
+// Vraća listu prepoznatih objekata (ili null ako analiza nije izvršena)
 async function prepoznajObjekte() {
   const slika = $('kameraSlika');
-  if (!kameraUkljucena || !urlSlike || !slika.complete || !slika.naturalWidth) return;
+  if (analizaUToku || !kameraUkljucena || !urlSlike || !slika.complete || !slika.naturalWidth) return null;
+  analizaUToku = true;
   $('dugmeAnaliza').disabled = true;
+  let rezultati = null;
   try {
     porukaKamere(modelPromise ? 'Analiziram...' : 'Učitavam model (prvi put traje malo duže)...');
     const model = await ucitajModel();
@@ -408,7 +435,7 @@ async function prepoznajObjekte() {
     ulaz.getContext('2d').drawImage(slika, 0, 0, ulaz.width, ulaz.height);
     const fx = ulaz.width / slika.naturalWidth, fy = ulaz.height / slika.naturalHeight;
     const sve = await model.detect(ulaz);            // vraća listu: { bbox, class, score }
-    const rezultati = sve.filter((r) => r.score >= MIN_POUZDANOST)
+    rezultati = sve.filter((r) => r.score >= MIN_POUZDANOST)
       .map((r) => ({ ...r, bbox: [r.bbox[0] / fx, r.bbox[1] / fy, r.bbox[2] / fx, r.bbox[3] / fy] })); // nazad u piksele originalne slike
     prikaziRezultate(rezultati);
     if (rezultati.length) {
@@ -421,9 +448,37 @@ async function prepoznajObjekte() {
   } catch (e) {
     porukaKamere('Greška: ' + e.message, true);
   } finally {
+    analizaUToku = false;
     $('dugmeAnaliza').disabled = !(kameraUkljucena && urlSlike);
   }
+  return rezultati;
 }
+
+// ===== Spoj: pokret -> analiza slike -> alarm =====
+async function analizaPriPokretu() {
+  if (!$('autoAnaliza').checked) return;
+  if (!kameraUkljucena || !urlSlike) {
+    dodajUDnevnik('Pokret: nema kadra za analizu (uključi kameru i izaberi sliku)', 'upozorenje');
+    return;
+  }
+  dodajUDnevnik('Pokret → automatska analiza slike...');
+  const rezultati = await prepoznajObjekte();
+  if (rezultati === null) return;                    // analiza nije izvršena (greška ili već traje)
+  if (rezultati.some((r) => r.class === 'person')) { // prepoznata osoba -> komanda za alarm ESP32-u
+    klijent.publish(TEMA_ALARM_SET, 'on');
+    dodajUDnevnik('OSOBA prepoznata → poslata komanda za ALARM', 'pokret');
+    clearTimeout(cekanjePotvrde);
+    cekanjePotvrde = setTimeout(() => dodajUDnevnik('ESP32 nije potvrdio komandu (veza je možda prekinuta)', 'upozorenje'), 3000);
+  } else {
+    dodajUDnevnik('Pokret bez osobe u kadru – alarm nije potreban');
+  }
+}
+
+$('dugmeAlarm').addEventListener('click', () => {
+  if (!klijent.connected) return;
+  klijent.publish(TEMA_ALARM_SET, 'off');
+  dodajUDnevnik('Poslata komanda: alarm OFF', 'komanda');
+});
 $('dugmeAnaliza').addEventListener('click', prepoznajObjekte);
 new ResizeObserver(() => crtajOkvire(poslednjiRezultati)).observe($('videoOkvir')); // preračunaj okvire pri promeni veličine
 
@@ -437,7 +492,7 @@ klijent.on('connect', () => {
   prikaziBroker(true);
   dodajUDnevnik('Povezan na MQTT broker');
   // pretplata: kažemo brokeru koje teme želimo da primamo
-  klijent.subscribe([TEMA_POKRET, TEMA_STATUS, TEMA_SERVO_STANJE, TEMA_KAMERA_STANJE]);
+  klijent.subscribe([TEMA_POKRET, TEMA_STATUS, TEMA_SERVO_STANJE, TEMA_KAMERA_STANJE, TEMA_ALARM_STANJE]);
 });
 klijent.on('close', () => prikaziBroker(false));
 klijent.on('error', (greska) => dodajUDnevnik('MQTT greška: ' + greska.message));
@@ -459,6 +514,11 @@ klijent.on('message', (tema, payload) => {
     clearTimeout(cekanjePotvrde);
     prikaziKameru(poruka === 'on');
 
+  } else if (tema === TEMA_ALARM_STANJE) {           // "on" ili "off"
+    clearTimeout(cekanjePotvrde);
+    if ((poruka === 'on') !== alarmAktivan) dodajUDnevnik(poruka === 'on' ? 'ALARM uključen' : 'Alarm isključen', poruka === 'on' ? 'pokret' : '');
+    prikaziAlarm(poruka === 'on');
+
   } else if (tema === TEMA_POKRET) {                 // JSON: {"stanje":"pokret","broj":1}
     let podaci;
     try { podaci = JSON.parse(poruka); } catch (e) { return; } // ignoriši neispravne poruke
@@ -467,6 +527,7 @@ klijent.on('message', (tema, payload) => {
       dodajUDnevnik('POKRET detektovan (#' + (Number(podaci.broj) || '?') + ') – kamera aktivirana', 'pokret');
       zvucniSignal();
       sistemskoObavestenje('Pokret detektovan!');
+      analizaPriPokretu();                           // automatska analiza slike
     } else if (podaci.stanje === 'mirno') {
       prikaziPokret(false);
       dodajUDnevnik('Pokret prestao – kamera isključena');
