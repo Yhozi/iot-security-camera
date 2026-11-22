@@ -1,5 +1,6 @@
-// ===== Virtuelna pametna sigurnosna kamera - FAZA 2 (v3) =====
+// ===== Virtuelna pametna sigurnosna kamera - FAZA 5 (v4) =====
 // PIR pokret -> LED + buzzer + kamera se UKLJUCI + MQTT obaveštenje
+// Veb-interfejs analizira sliku; ako prepozna osobu, šalje komandu ALARM (treperenje LED + isprekidan zvuk)
 // Dugme KAMERA (ili klizač u veb-interfejsu) -> uključuje/isključuje kameru kad god želiš
 // Dugmad LEVO/DESNO (ili dugmad u veb-interfejsu) -> okreću servo motor
 
@@ -22,6 +23,8 @@ const char* TEMA_SERVO_SET     = PREFIKS "servo/set";     // svet -> ESP32: levo
 const char* TEMA_SERVO_STANJE  = PREFIKS "servo/state";   // ESP32 -> svet: trenutni ugao
 const char* TEMA_KAMERA_SET    = PREFIKS "camera/set";    // svet -> ESP32: on/off/toggle
 const char* TEMA_KAMERA_STANJE = PREFIKS "camera/state";  // ESP32 -> svet: on/off
+const char* TEMA_ALARM_SET     = PREFIKS "alarm/set";     // svet -> ESP32: on/off (alarm)
+const char* TEMA_ALARM_STANJE  = PREFIKS "alarm/state";   // ESP32 -> svet: on/off
 
 // ---- Konfiguracija pinova ----
 const int PIN_PIR        = 13;  // izlaz PIR senzora
@@ -39,6 +42,7 @@ const int UGAO_MAX   = 180;
 const int KORAK      = 15;     // stepeni po jednoj komandi
 
 const unsigned long PAUZA_PONOVNOG_POVEZIVANJA = 1000; // posle prekida veze pokušaj ponovo za 1 s
+const unsigned long ALARM_TRAJANJE_MS = 8000;          // alarm se sam gasi posle 8 s
 
 WiFiClient   wifiKlijent;          // TCP veza ka internetu
 PubSubClient mqtt(wifiKlijent);    // MQTT klijent koji koristi tu vezu
@@ -47,6 +51,9 @@ Servo kameraServo;
 String idKlijenta;                 // ID se pravi JEDNOM pri pokretanju (isti ID pri ponovnom povezivanju)
 int ugao = UGAO_START;
 bool kameraUkljucena = false;      // da li je (virtuelna) kamera uključena
+bool alarmAktivan = false;         // da li je alarm uključen
+unsigned long alarmPocetak = 0;    // kada je alarm uključen
+unsigned long poslednjiZvuk = 0;   // kada je poslednji put oglasio zvuk alarma
 bool prethodnoStanje = false;
 bool prethodnoLevo = false;
 bool prethodnoDesno = false;
@@ -74,6 +81,21 @@ void postaviKameru(bool ukljuci) {
   kameraUkljucena = ukljuci;
   Serial.printf("KAMERA: %s\n", ukljuci ? "uključena" : "isključena");
   posaljiStanjeKamere();   // uvek javi novo stanje (i kad se nije promenilo, kao potvrdu komande)
+}
+
+// Javi veb-interfejsu da li je alarm uključen (retained)
+void posaljiStanjeAlarma() {
+  if (!mqtt.connected()) return;
+  mqtt.publish(TEMA_ALARM_STANJE, alarmAktivan ? "on" : "off", true);
+}
+
+// Uključi/isključi alarm. Komandu šalje veb-interfejs kad prepozna osobu na slici.
+void postaviAlarm(bool ukljuci) {
+  alarmAktivan = ukljuci;
+  if (ukljuci) alarmPocetak = millis();
+  else digitalWrite(PIN_LED, prethodnoStanje ? HIGH : LOW);  // posle alarma LED opet prati PIR senzor
+  Serial.printf("ALARM: %s\n", ukljuci ? "UKLJUCEN" : "iskljucen");
+  posaljiStanjeAlarma();
 }
 
 // Pomeri servo za delta stepeni (negativno = levo, pozitivno = desno).
@@ -113,6 +135,11 @@ void naPoruku(char* tema, byte* payload, unsigned int duzina) {
     else if (poruka == "off")    postaviKameru(false);
     else if (poruka == "toggle") postaviKameru(!kameraUkljucena);
     else Serial.println("Nepoznata komanda (ocekujem: on / off / toggle)");
+
+  } else if (strcmp(tema, TEMA_ALARM_SET) == 0) {     // komande za alarm
+    if (poruka == "on")       postaviAlarm(true);
+    else if (poruka == "off") postaviAlarm(false);
+    else Serial.println("Nepoznata komanda (ocekujem: on / off)");
   }
 }
 
@@ -135,9 +162,11 @@ void spojiMQTT() {
     mqtt.publish(TEMA_STATUS, "online", true);   // javi da smo online
     bool ok1 = mqtt.subscribe(TEMA_SERVO_SET);   // slušaj komande za servo
     bool ok2 = mqtt.subscribe(TEMA_KAMERA_SET);  // slušaj komande za kameru
-    Serial.printf("MQTT: pretplate -> %s\n", (ok1 && ok2) ? "OK" : "NEUSPESNO");
+    bool ok3 = mqtt.subscribe(TEMA_ALARM_SET);   // slušaj komande za alarm
+    Serial.printf("MQTT: pretplate -> %s\n", (ok1 && ok2 && ok3) ? "OK" : "NEUSPESNO");
     posaljiUgao();
     posaljiStanjeKamere();
+    posaljiStanjeAlarma();
   } else {
     Serial.printf("greska (rc=%d), pokusavam ponovo\n", mqtt.state());
   }
@@ -208,6 +237,20 @@ void loop() {
     Serial.println("Pokret prestao.");
   }
   prethodnoStanje = pokret;
+
+  // ---------- 1b) Alarm (bez blokiranja: LED treperi, zvuk na svakih 0,5 s) ----------
+  if (alarmAktivan) {
+    unsigned long protekloVreme = millis() - alarmPocetak;
+    if (protekloVreme > ALARM_TRAJANJE_MS) {
+      postaviAlarm(false);                              // istekao: ugasi sam
+    } else {
+      digitalWrite(PIN_LED, (protekloVreme / 150) % 2 == 0 ? HIGH : LOW);  // treperenje
+      if (millis() - poslednjiZvuk > 500) {
+        poslednjiZvuk = millis();
+        beep(150);
+      }
+    }
+  }
 
   // ---------- 2) Lokalna dugmad ----------
   bool levo   = (digitalRead(PIN_BTN_LEVO)   == LOW);  // LOW = pritisnuto
