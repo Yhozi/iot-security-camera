@@ -16,13 +16,9 @@ IoT prototip: PIR senzor detektuje pokret, ESP32 reaguje (LED, buzzer, servo), k
 
 ## Arhitektura
 
-![Arhitektura](docs/arhitektura.png)
-
 ESP32 i veb-interfejs ne komuniciraju direktno nego preko javnog MQTT brokera (`broker.hivemq.com`).
 
 ## Električna šema
-
-![Šema](docs/sema.png)
 
 | Komponenta | ESP32 pin |
 |---|---|
